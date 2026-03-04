@@ -54,6 +54,8 @@ import {
 import deferralApi from "../../service/deferralApi";
 import dayjs from "dayjs";
 import { useNavigate } from "react-router-dom";
+import { generateChecklistPDFBlob } from "../../utils/reportGenerator";
+import { getStatusStyle, formatStatusText } from "../../utils/statusColors";
 
 // Import the separate components
 import DocumentPicker from "../../components/deferrals/DocumentPicker";
@@ -239,6 +241,7 @@ export default function DeferralForm({ userId, onSuccess }) {
   const dclSearchTimeoutRef = useRef(null);
   const [isSearchedByDcl, setIsSearchedByDcl] = useState(false); // Track if DCL search was used
   const [selectedDclId, setSelectedDclId] = useState(null); // Store selected DCL ID
+  const [selectedChecklistStatus, setSelectedChecklistStatus] = useState("");
 
   // File upload states
   const [dclFile, setDclFile] = useState(null);
@@ -503,18 +506,33 @@ export default function DeferralForm({ userId, onSuccess }) {
     try {
       const stored = JSON.parse(localStorage.getItem('user') || 'null');
       const token = stored?.token;
-      const url = `${import.meta.env.VITE_API_URL}/api/customers/search-dcl?dclNo=${encodeURIComponent(q)}`;
+
+      // Normalize API base similar to service utilities and fall back to localhost:5000
+      const rawApi = String(import.meta.env.VITE_API_URL || "").trim().replace(/^['"]|['"]$/g, "");
+      const apiBase = (() => {
+        if (!rawApi) return "http://localhost:5000";
+        if (/^https?:\/\//i.test(rawApi)) return rawApi.replace(/\/$/, '');
+        if (rawApi.startsWith(":")) return `http://localhost${rawApi}`;
+        return `http://${rawApi}`;
+      })();
+
+      const url = `${apiBase.replace(/\/$/, '')}/api/customers/search-dcl?dclNo=${encodeURIComponent(q)}`;
       const res = await fetch(url, {
         headers: {
           ...(token ? { authorization: `Bearer ${token}` } : {}),
           "content-type": "application/json",
         },
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        console.debug('DCL typeahead response not OK', res.status);
+        setDclSearchResults([]);
+        return;
+      }
       const results = await res.json();
       setDclSearchResults(Array.isArray(results) ? results : []);
     } catch (err) {
       console.error("DCL typeahead search failed", err);
+      setDclSearchResults([]);
     }
   };
 
@@ -546,6 +564,7 @@ export default function DeferralForm({ userId, onSuccess }) {
     setDclNumber(deferral.dclNo || ""); // Auto-fill DCL number field
     setSelectedCustomerId(deferral.customerId || null);
     setSelectedDclId(deferral.id); // Store the selected DCL ID
+    setSelectedChecklistStatus(deferral.status || "");
     setIsSearchedByDcl(true); // Mark that DCL search was used
 
     // Fetch and auto-download the DCL file
@@ -558,7 +577,7 @@ export default function DeferralForm({ userId, onSuccess }) {
   };
 
   // ----------------------
-  // FETCH DCL FILE
+  // FETCH DCL FILE (attempt to use existing upload, otherwise auto-generate PDF)
   // ----------------------
   const fetchDclFile = async (checklistId, dclNumber) => {
     try {
@@ -581,36 +600,42 @@ export default function DeferralForm({ userId, onSuccess }) {
 
       const checklist = await res.json();
 
-      // Find the most recent DCL file (if documents array exists)
+      // Track the checklist status so UI can display it in customer info
+      setSelectedChecklistStatus(checklist.status || "");
+
+      // Flatten any document lists
+      const allDocs = [];
       if (checklist.documents && Array.isArray(checklist.documents)) {
-        // Flatten all documents and find the most recent one
-        const allDocs = [];
         checklist.documents.forEach(category => {
           if (category.docList && Array.isArray(category.docList)) {
             allDocs.push(...category.docList);
           }
         });
+      }
 
-        // Sort by timestamp and get the most recent
+      // If an uploaded DCL file exists, use it
+      if (allDocs.length > 0) {
         allDocs.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-
-        if (allDocs.length > 0) {
-          const latestDoc = allDocs[0];
-
-          // Set the DCL file with the document details for display in the compartment
-          if (latestDoc.fileUrl || latestDoc.url) {
-            const fileName = latestDoc.name || `${dclNumber}.pdf`;
-            const fileUrl = latestDoc.fileUrl || latestDoc.url;
-
-            setDclFile({
-              name: fileName,
-              url: fileUrl,
-              type: latestDoc.type || 'DCL',
-              isDCL: true,
-              size: latestDoc.size || 0,
-            });
-          }
+        const latestDoc = allDocs[0];
+        if (latestDoc && (latestDoc.fileUrl || latestDoc.url)) {
+          const fileName = latestDoc.name || `${dclNumber}.pdf`;
+          const fileUrl = latestDoc.fileUrl || latestDoc.url;
+          setDclFile({ name: fileName, url: fileUrl, type: latestDoc.type || 'DCL', isDCL: true, size: latestDoc.size || 0 });
+          return;
         }
+      }
+
+      // No existing upload found — try to auto-generate a PDF from checklist data
+      try {
+        const blob = await generateChecklistPDFBlob(checklist, allDocs, checklist.comments || []);
+        if (blob) {
+          const fileName = `${dclNumber || checklist.dclNo || 'DCL'}.pdf`;
+          const generatedFile = new File([blob], fileName, { type: 'application/pdf' });
+          setDclFile(generatedFile);
+          message.success(`${fileName} auto-generated and attached`);
+        }
+      } catch (genErr) {
+        console.error('Failed to auto-generate DCL PDF:', genErr);
       }
     } catch (err) {
       console.error("Failed to fetch DCL file:", err);
@@ -891,13 +916,15 @@ export default function DeferralForm({ userId, onSuccess }) {
               </Text>
             </div>
           </Descriptions.Item>
-          <Descriptions.Item label="Approver">
+          <Descriptions.Item label="DCL Status">
             <div style={{ display: "flex", alignItems: "center" }}>
-              <Text strong style={{
-                color: firstApprover === "Pending" ? "#d9d9d9" : PRIMARY_PURPLE
-              }}>
-                {firstApprover}
-              </Text>
+              {selectedChecklistStatus ? (
+                <Tag style={getStatusStyle(selectedChecklistStatus)}>
+                  {formatStatusText(selectedChecklistStatus)}
+                </Tag>
+              ) : (
+                <Text strong style={{ color: "#d9d9d9" }}>Pending</Text>
+              )}
             </div>
           </Descriptions.Item>
           <Descriptions.Item label="Loan Type">
@@ -1563,30 +1590,54 @@ export default function DeferralForm({ userId, onSuccess }) {
     await handleSubmitDeferral();
   };
 
-  const renderConfirmModal = () => (
-    <Modal
-      open={showConfirmModal}
-      title={`Confirm submission to approver${approverSlots.filter(s => s.userId).length > 1 ? 's' : ''}`}
-      onCancel={() => setShowConfirmModal(false)}
-      footer={[
-        <Button key="back" onClick={() => setShowConfirmModal(false)}>Cancel</Button>,
-        <Button key="submit" type="primary" onClick={handleConfirmSubmit} disabled={approverSlots.filter(s => s.userId).length === 0} loading={isSubmitting}>
-          Confirm & Submit
-        </Button>
-      ]}
-      width={900}
-      centered
-    >
-      <Descriptions bordered column={1} size="small">
-        <Descriptions.Item label="Deferral Number">{previewDeferralNumber}</Descriptions.Item>
-        <Descriptions.Item label="Customer">{customerName} — {customerNumber}</Descriptions.Item>
-        <Descriptions.Item label="DCL No">{dclNumber}</Descriptions.Item>
+  const renderConfirmModal = () => {
+    // Derive formatted loan amount using the same logic as DeferralPending
+    const numericLoan = parsedLoanAmount();
+    const formattedLoanAmount = numericLoan && Number(numericLoan) > 0
+      ? `KSh ${Number(numericLoan).toLocaleString()}`
+      : 'Not specified';
+    const isAboveThreshold = Number(numericLoan) > LOAN_THRESHOLD;
 
-        <Descriptions.Item label="Loan Type">{formatLoanType(loanType)}</Descriptions.Item>
-        <Descriptions.Item label="Days Sought">{daysSought || '-'}</Descriptions.Item>
-        <Descriptions.Item label="Deferred due date">{nextDueDate || '-'}</Descriptions.Item>
+    // Format deferred due date consistently
+    const formattedDeferredDueDate = nextDueDate ? dayjs(nextDueDate).format('DD MMM YYYY') : '-';
 
-        <Descriptions.Item label="Document(s) to be deferred">
+    return (
+      <Modal
+        open={showConfirmModal}
+        title={`Confirm submission to approver${approverSlots.filter(s => s.userId).length > 1 ? 's' : ''}`}
+        onCancel={() => setShowConfirmModal(false)}
+        footer={[
+          <Button key="back" onClick={() => setShowConfirmModal(false)}>Cancel</Button>,
+          <Button key="submit" type="primary" onClick={handleConfirmSubmit} disabled={approverSlots.filter(s => s.userId).length === 0} loading={isSubmitting}>
+            Confirm & Submit
+          </Button>
+        ]}
+        width={900}
+        centered
+      >
+        <Descriptions bordered column={1} size="small">
+          <Descriptions.Item label="Deferral Number">{previewDeferralNumber}</Descriptions.Item>
+          <Descriptions.Item label="Customer">{customerName} — {customerNumber}</Descriptions.Item>
+          <Descriptions.Item label="DCL No">{dclNumber}</Descriptions.Item>
+
+          <Descriptions.Item label="Loan Type">{formatLoanType(loanType)}</Descriptions.Item>
+          <Descriptions.Item label="Loan Amount">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {formattedLoanAmount === 'Not specified' ? (
+                <div>Not specified</div>
+              ) : (
+                <div>
+                  <Tag color={isAboveThreshold ? 'red' : 'blue'} style={{ fontWeight: 700 }}>
+                    {isAboveThreshold ? 'Above 75 million' : 'Below 75 million'}
+                  </Tag>
+                </div>
+              )}
+            </div>
+          </Descriptions.Item>
+          <Descriptions.Item label="Days Sought">{daysSought || '-'}</Descriptions.Item>
+          <Descriptions.Item label="Deferred due date">{formattedDeferredDueDate}</Descriptions.Item>
+
+          <Descriptions.Item label="Document(s) to be deferred">
           {selectedDocuments && selectedDocuments.length > 0 ? (
             <List
               size="small"
@@ -1713,6 +1764,7 @@ export default function DeferralForm({ userId, onSuccess }) {
       </Descriptions>
     </Modal>
   );
+};
 
   const renderApproverSidebar = () => (
     <Card

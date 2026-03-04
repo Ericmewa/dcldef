@@ -218,8 +218,6 @@ import getFacilityColumns from '../../utils/facilityColumns';
 import { formatDeferralDocumentType } from "../../utils/deferralDocumentType";
 import { getDeferralDocumentBuckets } from "../../utils/deferralDocuments";
 import UniformTag from "../../components/common/UniformTag";
-import ExtensionApplicationsTab from "../../components/ExtensionApplicationsTab";
-import { useGetApproverExtensionsQuery } from "../../api/extensionApi";
 import { useNavigate } from "react-router-dom";
 
 const { RangePicker } = DatePicker;
@@ -314,6 +312,7 @@ const customStyles = `
 // Deferral Details Modal for MyQueue - Shows status as pending
 const DeferralDetailsModal = ({
   deferral,
+  extension = null,
   open,
   onClose,
   onAction,
@@ -468,13 +467,87 @@ const DeferralDetailsModal = ({
   const doApprove = async () => {
     setApproveLoading(true);
     try {
-      const updated = await deferralApi.approveDeferral(deferral._id || deferral.id, approvalComment, token);
-      message.success('Deferral approved successfully');
-      if (onAction) onAction('refreshQueue');
-      if (onAction) onAction('gotoActioned');
-      try { window.dispatchEvent(new CustomEvent('deferral:updated', { detail: updated })); } catch (e) { console.debug('Failed to dispatch deferral:updated', e); }
-      setShowApproveConfirm(false);
-      onClose();
+      // If this modal is showing an extension application, call the extensions API instead
+      if (isExtensionModal && extension && (extension._id || extension.id)) {
+        const extId = extension._id || extension.id;
+        console.debug('Approving extension (optimistic)', { extId, tokenPresent: !!token, approvalComment, extension });
+
+        // Optimistic UI: mark current approver as approved locally and advance to next
+        const originalExtension = JSON.parse(JSON.stringify(extension));
+        const optimistic = JSON.parse(JSON.stringify(extension));
+        try {
+          const currentIdx = optimistic.approvers ? optimistic.approvers.findIndex(a => a.isCurrent) : -1;
+          if (currentIdx !== -1) {
+            optimistic.approvers[currentIdx].approvalStatus = 'Approved';
+            optimistic.approvers[currentIdx].approvalDate = new Date().toISOString();
+            optimistic.approvers[currentIdx].approvalComment = approvalComment || '';
+            optimistic.approvers[currentIdx].isCurrent = false;
+
+            // Find next approver by Sequence if available, fallback to first pending
+            let next = null;
+            if (optimistic.approvers.some(a => typeof a.sequence !== 'undefined')) {
+              const currSeq = optimistic.approvers[currentIdx].sequence || 0;
+              next = optimistic.approvers
+                .filter(a => a.approvalStatus === 'Pending' && (a.sequence || 0) > currSeq)
+                .sort((a, b) => (a.sequence || 0) - (b.sequence || 0))[0] || null;
+            }
+            if (!next) {
+              next = optimistic.approvers.find(a => a.approvalStatus === 'Pending');
+            }
+            if (next) {
+              next.isCurrent = true;
+              optimistic.status = 'InReview';
+            } else {
+              optimistic.allApproversApproved = true;
+              optimistic.status = 'Approved';
+            }
+          }
+
+          // Broadcast optimistic update
+          try { window.dispatchEvent(new CustomEvent('extension:updated', { detail: optimistic })); } catch (e) { console.debug('Failed to dispatch optimistic extension:updated', e); }
+          if (onAction) onAction('refreshQueue');
+          if (onAction) onAction('gotoActioned');
+          setShowApproveConfirm(false);
+          onClose();
+
+          // Perform server request
+          const res = await fetch(`http://localhost:5000/api/extensions/${extId}/approve`, {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(token ? { authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({ comment: approvalComment }),
+          });
+
+          if (!res.ok) {
+            let body = null;
+            try { body = await res.json(); } catch (e) { body = await res.text().catch(() => null); }
+            console.error('Extension approve failed', { status: res.status, body });
+            // Revert optimistic update
+            try { window.dispatchEvent(new CustomEvent('extension:updated', { detail: originalExtension })); } catch (e) { console.debug('Failed to revert optimistic extension:updated', e); }
+            if (res.status === 403) {
+              throw new Error(body?.message || body?.error || 'Forbidden: you are not authorized to approve this extension or you are not the current approver');
+            }
+            throw new Error(body?.message || body?.error || `Failed to approve extension (${res.status})`);
+          }
+
+          const updated = await res.json();
+          // Ensure authoritative state is broadcast
+          try { window.dispatchEvent(new CustomEvent('extension:updated', { detail: updated })); } catch (e) { console.debug('Failed to dispatch extension:updated', e); }
+          message.success('Extension approved successfully');
+        } catch (err) {
+          message.error(err.message || 'Failed to approve');
+        }
+      } else {
+        const updated = await deferralApi.approveDeferral(deferral._id || deferral.id, approvalComment, token);
+        message.success('Deferral approved successfully');
+        if (onAction) onAction('refreshQueue');
+        if (onAction) onAction('gotoActioned');
+        try { window.dispatchEvent(new CustomEvent('deferral:updated', { detail: updated })); } catch (e) { console.debug('Failed to dispatch deferral:updated', e); }
+        setShowApproveConfirm(false);
+        onClose();
+      }
     } catch (err) {
       message.error(err.message || 'Failed to approve');
     } finally {
@@ -495,12 +568,62 @@ const DeferralDetailsModal = ({
 
     setRejecting(true);
     try {
-      const updated = await deferralApi.rejectDeferral(
-        deferral._id || deferral.id,
-        { reason: rejectComment.trim() },
-        token,
-      );
-      message.success('Deferral rejected');
+      if (isExtensionModal && extension && (extension._id || extension.id)) {
+        const extId = extension._id || extension.id;
+        const res = await fetch(`http://localhost:5000/api/extensions/${extId}/reject`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({ reason: rejectComment.trim() }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err?.error || err?.message || `Failed to reject extension (${res.status})`);
+        }
+        const updated = await res.json();
+        message.success('Extension rejected');
+      } else {
+        const updated = await deferralApi.rejectDeferral(
+          deferral._id || deferral.id,
+          { reason: rejectComment.trim() },
+          token,
+        );
+        message.success('Deferral rejected');
+      }
+      // Also record the rejection as a comment and history entry so it appears in trails
+      try {
+        const storedUser = JSON.parse(localStorage.getItem('user') || 'null') || {};
+        const currentUser = storedUser?.user || storedUser || {};
+        const authorName = currentUser?.name || currentUser?.userName || 'Approver';
+        const authorRole = currentUser?.role || currentUser?.user?.role || 'Approver';
+
+        const commentData = {
+          text: rejectComment.trim(),
+          author: {
+            name: authorName,
+            role: authorRole,
+          },
+          createdAt: new Date().toISOString(),
+        };
+
+        // Post as a comment (visible in comments tab)
+        await deferralApi.postComment(deferral._id || deferral.id, commentData, token);
+
+        // Add an explicit history entry for audit trail
+        const historyEntry = {
+          action: 'rejected',
+          userName: authorName,
+          userRole: authorRole,
+          date: new Date().toISOString(),
+          comment: rejectComment.trim(),
+        };
+        await deferralApi.addHistory(deferral._id || deferral.id, historyEntry, token);
+      } catch (auditErr) {
+        console.warn('Failed to append rejection comment/history:', auditErr);
+      }
+
       if (onAction) onAction('refreshQueue');
       // Navigate approver to their Actioned tab so this terminated item is visible in their action history
       if (onAction) onAction('gotoActioned');
@@ -691,11 +814,17 @@ const DeferralDetailsModal = ({
       ];
       yPosition = addCardSection('Deferral Details', deferralDetailsItems);
 
-      const loanAmount = Number(deferral.loanAmount || 0);
-      const formattedLoanAmount = loanAmount ? `KSh ${loanAmount.toLocaleString()}` : 'Not specified';
-      const isUnder75M = loanAmount > 0 && loanAmount < 75000000;
+      // compute loan amount from multiple possible fields or facilities
+      const loanCandidates = [deferral.loanAmount, deferral.requestedAmount, deferral.amount];
+      const facilitiesTotal = Array.isArray(deferral.facilities)
+        ? deferral.facilities.reduce((s, f) => s + (Number(f?.sanctioned ?? f?.amount ?? 0) || 0), 0)
+        : 0;
+      const detected = Number(loanCandidates.find(c => Number(c || 0) > 0) || facilitiesTotal || 0);
+      const formattedLoanAmount = detected ? `KSh ${detected.toLocaleString()}` : 'Not specified';
+      const classification = detected > 0 ? (detected < 75000000 ? 'below 75 million' : 'above 75 million') : null;
+      const classificationText = classification ? ` (${classification})` : '';
       const loanItems = [
-        { label: 'Loan Amount', value: formattedLoanAmount + (isUnder75M ? ' (Under 75M)' : ' (Above 75M)') },
+        { label: 'Loan Amount', value: formattedLoanAmount + classificationText },
         { label: 'Days Sought', value: `${deferral.daysSought || 0} days` },
         { label: 'Deferral Due Date', value: deferral.nextDueDate || deferral.nextDocumentDueDate ? dayjs(deferral.nextDueDate || deferral.nextDocumentDueDate).format('DD MMM YYYY') : 'Not calculated' },
         { label: 'SLA Expiry', value: deferral.slaExpiry ? dayjs(deferral.slaExpiry).format('DD MMM YYYY') : 'Not set' }
@@ -1112,6 +1241,8 @@ const DeferralDetailsModal = ({
     : (deferral.daysSought || 0);
   const nextDueDateValue = overrideNextDueDate || deferral.nextDueDate;
 
+  const isExtensionModal = headerTag === 'EXTENSION APPLICATION' || (overrideApprovals && overrideApprovals.approvers && overrideApprovals.approvers.length > 0);
+
   return (
     <>
       <style>{customStyles}</style>
@@ -1148,7 +1279,7 @@ const DeferralDetailsModal = ({
               Return for Rework
             </Button>
           ),
-          !readOnly && (deferral.status === "pending_approval" || deferral.status === "in_review" || deferral.status === "deferral_requested") ? (
+          !readOnly && (isExtensionModal || deferral.status === "pending_approval" || deferral.status === "in_review" || deferral.status === "deferral_requested") ? (
             <Button
               key="reject"
               type="primary"
@@ -1161,7 +1292,7 @@ const DeferralDetailsModal = ({
               Reject
             </Button>
           ) : null,
-          !readOnly && (deferral.status === "pending_approval" || deferral.status === "in_review" || deferral.status === "deferral_requested") ? (
+          !readOnly && (isExtensionModal || deferral.status === "pending_approval" || deferral.status === "in_review" || deferral.status === "deferral_requested") ? (
             <Button
               key="approve"
               type="primary"
@@ -1219,38 +1350,43 @@ const DeferralDetailsModal = ({
                 </Descriptions.Item>
                 <Descriptions.Item label="DCL No"><Text strong style={{ color: PRIMARY_BLUE }}>{deferral.dclNo || deferral.dclNumber}</Text></Descriptions.Item>
                 <Descriptions.Item label="Status">
-                  {status === 'deferral_requested' || status === 'pending_approval' ? (
-                    <UniformTag color="processing" text="Pending" />
-                  ) : status === 'deferral_approved' || status === 'approved' ? (
-                    <UniformTag color="success" text="Approved" />
-                  ) : status === 'deferral_rejected' || status === 'rejected' ? (
-                    <UniformTag color="error" text="Rejected" />
-                  ) : (
-                    <div style={{ fontWeight: 500 }}>{status}</div>
-                  )}
+                  {(() => {
+                    const raw = (deferral.status || 'pending').toString();
+                    const key = raw.toLowerCase();
+                    const display = key.replace(/_/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                    let color = PRIMARY_BLUE;
+                    if (key.includes('approved')) color = SUCCESS_GREEN;
+                    else if (key.includes('rejected')) color = ERROR_RED;
+                    else if (key.includes('returned') || key.includes('rework')) color = WARNING_ORANGE;
+                    return <Text strong style={{ color }}>{display}</Text>;
+                  })()}
                 </Descriptions.Item>
 
                 <Descriptions.Item label="Creator Status">
-                  <UniformTag
-                    color={deferral.creatorApprovalStatus === 'approved' ? 'success' : deferral.creatorApprovalStatus === 'rejected' ? 'error' : 'processing'}
-                    text={deferral.creatorApprovalStatus === 'approved' ? 'Approved' : deferral.creatorApprovalStatus === 'rejected' ? 'Rejected' : 'Pending'}
-                  />
+                  {(() => {
+                    const cs = (deferral.creatorApprovalStatus || 'pending').toString().toLowerCase();
+                    if (cs === 'approved') return <Text strong style={{ color: SUCCESS_GREEN }}>Approved</Text>;
+                    if (cs === 'rejected') return <Text strong style={{ color: ERROR_RED }}>Rejected</Text>;
+                    return <Text strong style={{ color: PRIMARY_BLUE }}>Pending</Text>;
+                  })()}
                 </Descriptions.Item>
 
                 <Descriptions.Item label="Checker Status">
-                  <UniformTag
-                    color={deferral.checkerApprovalStatus === 'approved' ? 'success' : deferral.checkerApprovalStatus === 'rejected' ? 'error' : 'processing'}
-                    text={deferral.checkerApprovalStatus === 'approved' ? 'Approved' : deferral.checkerApprovalStatus === 'rejected' ? 'Rejected' : 'Pending'}
-                  />
+                  {(() => {
+                    const cs = (deferral.checkerApprovalStatus || 'pending').toString().toLowerCase();
+                    if (cs === 'approved') return <Text strong style={{ color: SUCCESS_GREEN }}>Approved</Text>;
+                    if (cs === 'rejected') return <Text strong style={{ color: ERROR_RED }}>Rejected</Text>;
+                    return <Text strong style={{ color: PRIMARY_BLUE }}>Pending</Text>;
+                  })()}
                 </Descriptions.Item>
 
                 <Descriptions.Item label="Approvers Status">
                   {stats.total === 0 ? (
-                    <UniformTag color="processing" text="No approvers" maxChars={12} />
+                    <Text strong style={{ color: PRIMARY_BLUE }}>No approvers</Text>
                   ) : stats.approved === stats.total ? (
-                    <UniformTag color="success" icon={<CheckCircleOutlined />} text="All Approved" maxChars={12} />
+                    <Text strong style={{ color: SUCCESS_GREEN }}>All Approved</Text>
                   ) : (
-                    <UniformTag color="processing" text={`${stats.approved} of ${stats.total} Approved`} maxChars={14} />
+                    <Text strong style={{ color: PRIMARY_BLUE }}>{`${stats.approved} of ${stats.total} Approved`}</Text>
                   )}
                 </Descriptions.Item>
 
@@ -1733,13 +1869,25 @@ const MyQueue = () => {
   const [deferrals, setDeferrals] = useState([]);
 
   // Handle opening extension details modal
-  const handleOpenExtensionDetails = (extension) => {
+  const handleOpenExtensionDetails = async (extension) => {
     if (!extension) return;
 
-    // Use the populated deferral data directly
-    const approvedDeferral = extension.deferral || {};
-   
-    if (!approvedDeferral._id) {
+    let approvedDeferral = extension.deferral || null;
+
+    // If the extension doesn't include embedded deferral data, try to fetch it by id
+    if (!approvedDeferral || !approvedDeferral._id) {
+      const possibleId = extension.deferralId || extension.deferral?._id || extension.deferralNumber || extension.deferralIdString;
+      if (possibleId) {
+        try {
+          const fetched = await deferralApi.getDeferralById(possibleId, token);
+          if (fetched && fetched._id) approvedDeferral = fetched;
+        } catch (err) {
+          console.error('Failed to fetch deferral for extension:', err);
+        }
+      }
+    }
+
+    if (!approvedDeferral || !approvedDeferral._id) {
       message.error('Unable to load deferral details for this extension');
       return;
     }
@@ -2235,6 +2383,7 @@ const MyQueue = () => {
       {selectedDeferral && extensionModalOpen && selectedExtension && (
         <DeferralDetailsModal
           deferral={selectedDeferral}
+          extension={selectedExtension}
           open={extensionModalOpen}
           token={token}
           onClose={() => {

@@ -1,3 +1,4 @@
+
 // import React from "react";
 // import { HiOutlineDocumentDownload } from "react-icons/hi";
 
@@ -57,10 +58,50 @@
 //     </div>
 //   );
 // }
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { HiOutlineDocumentDownload } from "react-icons/hi";
+import { Button, Tooltip } from "antd";
+import { BellOutlined } from "@ant-design/icons";
+import deferralApi from "../../service/deferralApi";
 
 export default function PendingDeferrals({ deferrals = [], onGeneratePDF }) {
+  const [hiddenMap, setHiddenMap] = useState({});
+
+  useEffect(() => {
+    // Load hidden reminders from localStorage on mount
+    const map = {};
+    (deferrals || []).forEach((d) => {
+      const id = d._id || d.id || d.Id || d.deferralNumber;
+      const key = `remind_block_${id}`;
+      const ts = parseInt(localStorage.getItem(key) || "0", 10);
+      if (ts && Date.now() < ts) map[id] = ts;
+    });
+    setHiddenMap(map);
+  }, [deferrals]);
+
+  const handleRemind = async (deferral) => {
+    const id = deferral._id || deferral.id || deferral.Id || deferral.deferralNumber;
+    const key = `remind_block_${id}`;
+
+    try {
+      const stored = JSON.parse(localStorage.getItem('user') || 'null');
+      const token = stored?.token;
+      const actorName = (stored?.user?.name) || (stored?.user?.email) || 'System';
+
+      await deferralApi.sendReminderAndLog(id, token, { actorName, text: `${actorName} initiated a reminder.` });
+
+      // Hide button for 1 hour
+      const expiry = Date.now() + 60 * 60 * 1000;
+      localStorage.setItem(key, String(expiry));
+      setHiddenMap((m) => ({ ...m, [id]: expiry }));
+
+      // optional user feedback
+      try { window.toast && window.toast('Reminder sent'); } catch {};
+    } catch (e) {
+      console.error('Failed to send reminder', e);
+      try { window.toast && window.toast('Reminder failed'); } catch {};
+    }
+  };
   if (!deferrals.length) {
     return (
       <div className="p-4 text-gray-500 text-center">
@@ -118,7 +159,21 @@ export default function PendingDeferrals({ deferrals = [], onGeneratePDF }) {
           </p>
 
           {/* PDF icon */}
-          <HiOutlineDocumentDownload className="absolute top-4 right-4 text-gray-400 hover:text-gray-600" />
+          <div className="absolute top-4 right-4 text-gray-400 hover:text-gray-600">
+            <HiOutlineDocumentDownload />
+          </div>
+          {/* Remind button - hidden for 1 hour after use per-deferral (localStorage) */}
+          {!hiddenMap[(deferral._id || deferral.id || deferral.Id || deferral.deferralNumber)] && (
+            <div className="absolute bottom-4 left-4">
+              <Tooltip title="Send reminder to approver">
+                <Button
+                  size="small"
+                  icon={<BellOutlined />}
+                  onClick={(e) => { e.stopPropagation(); handleRemind(deferral); }}
+                />
+              </Tooltip>
+            </div>
+          )}
         </div>
       ))}
     </div>

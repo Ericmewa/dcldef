@@ -72,12 +72,11 @@ import dayjs from "dayjs";
 import { openFileInNewTab, downloadFile } from '../../utils/fileUtils';
 import { formatDeferralDocumentType } from '../../utils/deferralDocumentType';
 import { getDeferralDocumentBuckets } from '../../utils/deferralDocuments';
+import { getLoanDisplay } from '../../utils/loanUtils';
 import deferralApi from '../../service/deferralApi.js';
 import { jsPDF } from 'jspdf';
-import ExtensionApplicationModal from '../../components/modals/ExtensionApplicationModal';
-import ExtensionApplicationsTab from '../../components/ExtensionApplicationsTab';
 import UniformTag from '../../components/common/UniformTag';
-import { useCreateExtensionMutation, useGetMyExtensionsQuery } from '../../api/extensionApi';
+// Extension components removed — fresh extension flow will be implemented later
 import { useGetApproversQuery } from '../../api/userApi';
 
 // Theme Colors (same as other queues)
@@ -269,6 +268,45 @@ const DeferralStatusAlert = ({ deferral, hideApprovedStatus }) => {
     status === "deferral_closed" ||
     status === "closed_by_co" ||
     status === "closed_by_creator";
+
+  // Withdrawn by RM (closed metadata)
+  const isWithdrawn = (
+    Boolean(deferral.closedByName) || Boolean(deferral.ClosedByName) ||
+    Boolean(deferral.closedAt) || Boolean(deferral.ClosedAt) ||
+    (isClosed && (deferral.closedByName || deferral.ClosedByName))
+  );
+
+  const withdrawnByName = deferral.closedByName || deferral.ClosedByName || null;
+  const withdrawnAt = deferral.closedAt || deferral.ClosedAt || null;
+
+  // Withdrawn status (takes precedence over fully-approved banner)
+  if (isWithdrawn) {
+    return (
+      <div
+        style={{
+          backgroundColor: `${ERROR_RED}15`,
+          borderColor: `${ERROR_RED}40`,
+          border: "1px solid",
+          borderRadius: 8,
+          padding: 16,
+          marginBottom: 18,
+          marginTop: 24,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+          <CloseCircleOutlined style={{ color: ERROR_RED, fontSize: 24 }} />
+          <div>
+            <h3 style={{ margin: 0, color: ERROR_RED, fontWeight: 700 }}>
+              Deferral Withdrawn
+            </h3>
+            <p style={{ margin: 4, color: "#666", fontSize: 14 }}>
+              This deferral has been withdrawn by {withdrawnByName || 'the Relationship Manager'}{withdrawnAt ? ` on ${dayjs(withdrawnAt).format('DD MMM YYYY')}` : ''}.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // Fully Approved Status
   if (isFullyApproved && !hideApprovedStatus) {
@@ -712,9 +750,19 @@ const ReturnForReworkModal = ({ open, onClose, deferral, onUpdate }) => {
   };
 
   // Approver management functions
-  const addApprover = (role) => {
+  const addApprover = (insertIndex, role) => {
     setApproverCustomized(true);
-    setApproverSlots([...approverSlots, { role: role || "Approver", userId: "", approved: false, locked: false }]);
+    const next = [...approverSlots];
+    const slot = { role: role || "Approver", userId: "", approved: false, locked: false };
+
+    if (typeof insertIndex === 'number' && Number.isFinite(insertIndex)) {
+      const clamped = Math.max(1, Math.min(insertIndex, next.length - 1));
+      next.splice(clamped, 0, slot);
+      setApproverSlots(next);
+      return;
+    }
+
+    setApproverSlots([...approverSlots, slot]);
   };
 
   const updateApprover = (index, userId) => {
@@ -1181,27 +1229,42 @@ const ReturnForReworkModal = ({ open, onClose, deferral, onUpdate }) => {
                       </Select>
                     </div>
 
-                    <Button
-                      type="text"
-                      danger
-                      icon={<DeleteOutlined />}
-                      onClick={() => removeApprover(index)}
-                      disabled={slot.locked || slot.approved || approverSlots.length <= 1}
-                      title={slot.approved ? "Cannot remove approver who has already approved" : ""}
-                    />
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                      {index < approverSlots.length - 1 && (
+                        <Button
+                          type="dashed"
+                          icon={<PlusOutlined />}
+                          onClick={() => addApprover(index + 1, 'Approver')}
+                          style={{ marginRight: 6 }}
+                        />
+                      )}
+                      <Button
+                        type="text"
+                        danger
+                        icon={<DeleteOutlined />}
+                        onClick={() => removeApprover(index)}
+                        disabled={slot.locked || slot.approved || approverSlots.length <= 1}
+                        title={slot.approved ? "Cannot remove approver who has already approved" : ""}
+                      />
+                    </div>
                   </div>
                 ))}
               </div>
 
-              {/* Add button */}
-              <div style={{ marginTop: 16, display: 'flex', justifyContent: 'center' }}>
-                <Button
-                  onClick={() => addApprover('Approver')}
-                  icon={<PlusOutlined />}
-                >
-                  Add
-                </Button>
-              </div>
+              {/* Note: Adding approvers is only allowed between existing approvers */}
+              {(() => {
+                const canAppendAfterFinal = (deferral && ((String(deferral.status || '').toLowerCase() === 'returned_by_creator') || (Array.isArray(approverSlots) && approverSlots.length > 0 && approverSlots.every(s => s.approved))));
+                if (canAppendAfterFinal) {
+                  return (
+                    <div style={{ marginTop: 16, display: 'flex', justifyContent: 'center' }}>
+                        <Button onClick={() => addApprover(undefined, 'Approver')} icon={<PlusOutlined />}>
+                          Add approver
+                        </Button>
+                      </div>
+                  );
+                }
+                return null;
+              })()}
             </>
           )}
         </Card>
@@ -1244,8 +1307,6 @@ const DeferralDetailsModal = ({
   open,
   onClose,
   onAction,
-  onApplyForExtension,
-  myExtensions = [],
   headerTag,
   overrideDaysSought,
   overrideNextDueDate,
@@ -1276,7 +1337,28 @@ const DeferralDetailsModal = ({
   const { data: availableApprovers = [], isLoading: loadingAvailableApprovers } = useGetApproversQuery();
 
   useEffect(() => {
-    setLocalDeferral(deferral);
+    // Ensure loanType is resolved from various possible shapes so modal shows accurate value
+    const resolveLoanType = (d) => {
+      if (!d) return null;
+      return (
+        d.loanType ||
+        d.deferralLoanType ||
+        d.deferral?.loanType ||
+        d.deferral?.loan?.loanType ||
+        d.deferral?.loan?.type ||
+        d.loan?.type ||
+        null
+      );
+    };
+
+    if (deferral) {
+      const resolved = { ...deferral };
+      const lt = resolveLoanType(deferral);
+      if (lt) resolved.loanType = lt;
+      setLocalDeferral(resolved);
+    } else {
+      setLocalDeferral(deferral);
+    }
 
     // Calculate if all approvers are approved
     // Use override approvals if provided (for extensions)
@@ -1490,29 +1572,41 @@ const DeferralDetailsModal = ({
         return;
       }
 
-      const resp = await deferralApi.sendReminder(localDeferral._id);
-
-      message.success(`Reminder sent to ${resp?.approverName || currentApprover.name || currentApprover.email}`);
-
-      // Update lastReminderSent in local state
-      setLocalDeferral(prev => ({
-        ...prev,
-        lastReminderSent: new Date().toISOString()
-      }));
-
-      // Add to history
+      const stored = JSON.parse(localStorage.getItem('user') || 'null');
+      const token = stored?.token;
       const currentUser = JSON.parse(localStorage.getItem('user') || '{}');
-      const newHistoryEntry = {
-        user: currentUser?.name || 'System',
-        userRole: currentUser?.role || 'system',
-        date: new Date().toISOString(),
-        comment: `Reminder sent to ${currentApprover.name || currentApprover.email}`
-      };
 
-      setLocalDeferral(prev => ({
-        ...prev,
-        history: [...(prev.history || []), newHistoryEntry]
-      }));
+      // Use API helper that logs a permanent system comment as well
+      await deferralApi.sendReminderAndLog(localDeferral._id, token, {
+        actorName: currentUser?.name || 'System',
+        text: `Reminder sent to ${currentApprover.name || currentApprover.email}`,
+      });
+
+      // Persist lastReminderSent locally so the Remind button stays hidden for an hour
+      const lastSentISO = new Date().toISOString();
+      try {
+        localStorage.setItem(`deferral_reminder_${localDeferral._id}`, lastSentISO);
+      } catch (e) {
+        console.warn('Failed to save reminder timestamp to localStorage', e);
+      }
+
+      // Also try to persist on server (best-effort) so other clients may see it
+      try {
+        await deferralApi.updateDeferral(localDeferral._id, { lastReminderSent: lastSentISO }, token);
+      } catch (updErr) {
+        console.warn('Failed to persist lastReminderSent on server (non-fatal):', updErr);
+      }
+
+      // Refresh the deferral so history is authoritative; localStorage timestamp will keep the button hidden locally
+      try {
+        const refreshed = await deferralApi.getDeferralById(localDeferral._id, token);
+        setLocalDeferral(refreshed);
+        window.dispatchEvent(new CustomEvent('deferral:updated', { detail: refreshed }));
+      } catch (refreshErr) {
+        console.warn('Failed to refresh deferral after reminder:', refreshErr);
+      }
+
+      message.success(`Reminder sent to ${currentApprover.name || currentApprover.email}`);
 
     } catch (error) {
       console.error("Error sending reminder:", error);
@@ -1528,12 +1622,24 @@ const DeferralDetailsModal = ({
 
   // Check if reminder can be sent (not sent in last hour)
   const canSendReminder = () => {
-    if (!localDeferral.lastReminderSent) return true;
+      // Prefer server-side timestamp when available
+      let lastSentIso = localDeferral.lastReminderSent || null;
 
-    const lastSent = new Date(localDeferral.lastReminderSent);
-    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+      // Fallback: check localStorage in case server doesn't persist the timestamp
+      if (!lastSentIso) {
+        try {
+          lastSentIso = localStorage.getItem(`deferral_reminder_${localDeferral._id}`) || null;
+        } catch (e) {
+          // ignore localStorage failures
+        }
+      }
 
-    return lastSent <= oneHourAgo;
+      if (!lastSentIso) return true;
+
+      const lastSent = new Date(lastSentIso);
+      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+
+      return lastSent <= oneHourAgo;
   };
 
   // Calculate approver statistics
@@ -1662,13 +1768,13 @@ const DeferralDetailsModal = ({
       yPosition = addCardSection('Deferral Details', deferralDetailsItems);
 
       // LOAN INFORMATION CARD
-      const loanAmount = Number(localDeferral.loanAmount || 0);
-      const formattedLoanAmount = loanAmount ? `KSh ${loanAmount.toLocaleString()}` : 'Not specified';
-      const isUnder75M = loanAmount > 0 && loanAmount < 75000000;
+      const { amountNumber: _loanAmountNumber, formattedAmount: _formattedLoanAmount, classification: _loanClassification } = getLoanDisplay(localDeferral || {});
+      const formattedLoanAmount = _formattedLoanAmount;
+      const isUnder75M = _loanClassification === 'below 75 million';
       const daysSoughtColor = localDeferral.daysSought > 45 ? 'Red' : localDeferral.daysSought > 30 ? 'Orange' : 'Normal';
 
       const loanItems = [
-        { label: 'Loan Amount', value: formattedLoanAmount + (isUnder75M ? ' (Under 75M)' : ' (Above 75M)') },
+        { label: 'Loan Amount', value: formattedLoanAmount + (_loanClassification ? ` (${_loanClassification})` : '') },
         { label: 'Days Sought', value: `${localDeferral.daysSought || 0} days` },
         { label: 'Deferral Due Date', value: localDeferral.nextDueDate || localDeferral.nextDocumentDueDate ? dayjs(localDeferral.nextDueDate || localDeferral.nextDocumentDueDate).format('DD MMM YYYY') : 'Not calculated' },
         { label: 'SLA Expiry', value: localDeferral.slaExpiry ? dayjs(localDeferral.slaExpiry).format('DD MMM YYYY') : 'Not set' }
@@ -2102,12 +2208,12 @@ const DeferralDetailsModal = ({
         throw new Error('Unable to withdraw: deferral id is missing');
       }
 
-      const updatedDeferral = await deferralApi.closeDeferral(deferralId, {
-        status: 'withdrawn',
+      // Call withdraw endpoint to terminate the deferral and mark RM as withdrawer
+      const withdrawResponse = await deferralApi.withdrawDeferral(deferralId, {
         reason: 'withdrawn by rm',
-        closedBy: 'rm',
-        closedAt: new Date()
+        comment: 'Withdrawn by RM via UI'
       });
+      const updatedDeferral = withdrawResponse?.deferral || withdrawResponse || { ...localDeferral, status: 'closed' };
 
       let emailNotificationFailed = false;
       try {
@@ -2122,9 +2228,9 @@ const DeferralDetailsModal = ({
       }
 
       if (emailNotificationFailed) {
-        message.warning('Deferral withdrawn successfully, but email notification failed.');
+        message.warning('Deferral recalled (withdrawn) successfully, but email notification failed.');
       } else {
-        message.success('Deferral withdrawn successfully. All approvers have been notified and the deferral has been moved to Completed.');
+        message.success('Deferral recalled (withdrawn) successfully. All approvers have been notified.');
       }
       window.dispatchEvent(new CustomEvent('deferral:updated', { detail: updatedDeferral }));
       onAction && onAction({ status: 'withdrawn', updatedDeferral });
@@ -2154,16 +2260,6 @@ const DeferralDetailsModal = ({
     }));
   };
 
-  const setCloseRequestDocumentComment = (documentName, comment) => {
-    setCloseRequestDocumentInputs((prev) => ({
-      ...prev,
-      [documentName]: {
-        ...(prev[documentName] || {}),
-        comment,
-      },
-    }));
-  };
-
   const handleSubmitCloseRequest = async () => {
     const deferralId = localDeferral?._id || localDeferral?.id;
     if (!deferralId) {
@@ -2179,7 +2275,6 @@ const DeferralDetailsModal = ({
       const documentComments = Object.entries(closeRequestDocumentInputs)
         .map(([documentName, value]) => ({
           documentName,
-          comment: (value?.comment || '').trim(),
           fileList: Array.isArray(value?.fileList) ? value.fileList : [],
         }));
 
@@ -2250,6 +2345,22 @@ const DeferralDetailsModal = ({
     } catch (e) {
       /* ignore */
     }
+
+    // Close any open modals and reset selection, then switch to Pending tab
+    try {
+      setReturnForReworkVisible(false);
+      setExtensionModalOpen(false);
+      setExtensionDetailsModalOpen(false);
+      setModalOpen(false);
+      setSelectedDeferral(null);
+      setSelectedExtension(null);
+    } catch (e) {
+      /* ignore */
+    }
+
+    setActiveTab('pending');
+    // Trigger a refresh for other listeners
+    if (window.deferralRefresh) window.deferralRefresh();
   };
 
   // Handle Extension Application
@@ -2511,14 +2622,7 @@ const DeferralDetailsModal = ({
                       <Button icon={<UploadOutlined />}>Upload Close Evidence</Button>
                     </Upload>
 
-                    <TextArea
-                      rows={2}
-                      value={currentValue.comment || ''}
-                      onChange={(e) =>
-                        setCloseRequestDocumentComment(documentName, e.target.value)
-                      }
-                      placeholder="Comment for this document"
-                    />
+                    {/* per-document comment removed - overall comment retained above */}
                   </Space>
                 </Card>
               );
@@ -2583,18 +2687,6 @@ const DeferralDetailsModal = ({
             </Button>
           ),
 
-          // Recall button - Available unless deferral is fully approved, returned for rework, or completed
-          !isApprovedStatus && !isFullyApproved && !isReturnedForRework && !isCompleted && (
-            <Button
-              key="recall"
-              onClick={handleRecallDeferral}
-              loading={loadingRecall}
-              style={{ backgroundColor: WARNING_ORANGE, borderColor: WARNING_ORANGE, color: 'white' }}
-            >
-              Recall Deferral
-            </Button>
-          ),
-
           // Withdraw button - Available unless deferral is fully approved or completed
           !isApprovedStatus && !isFullyApproved && !isCompleted && (
             <Button
@@ -2608,23 +2700,7 @@ const DeferralDetailsModal = ({
             </Button>
           ),
 
-          // Apply for Extension button (only for approved deferrals without existing extensions)
-          (status === 'deferral_approved' || status === 'approved') &&
-          onApplyForExtension &&
-          !myExtensions.some(ext => (ext.deferral === localDeferral._id || ext.deferral?._id === localDeferral._id || ext.deferralId === localDeferral._id)) && (
-            <Button
-              key="extension"
-              type="primary"
-              onClick={() => {
-                console.log('Apply for Extension clicked', localDeferral);
-                onApplyForExtension(localDeferral);
-              }}
-              style={{ backgroundColor: ACCENT_LIME, borderColor: ACCENT_LIME, color: PRIMARY_BLUE, fontWeight: 600 }}
-              icon={<FileDoneOutlined />}
-            >
-              Apply for Extension
-            </Button>
-          ),
+          // Apply for Extension removed
 
           // Submit Close Request button (RM approved tab)
           (status === 'deferral_approved' || status === 'approved') && (
@@ -2659,38 +2735,57 @@ const DeferralDetailsModal = ({
           <Descriptions size="middle" column={{ xs: 1, sm: 2, lg: 3 }}>
             <Descriptions.Item label="Deferral Number"><Text strong style={{ color: PRIMARY_BLUE }}>{localDeferral.deferralNumber}</Text></Descriptions.Item>
             <Descriptions.Item label="DCL No"><Text strong style={{ color: PRIMARY_BLUE }}>{localDeferral.dclNo || localDeferral.dclNumber}</Text></Descriptions.Item>
-            <Descriptions.Item label="Status">
-              {status === 'deferral_requested' || status === 'pending_approval' ? (
-                <UniformTag color="processing" text="Pending" />
-              ) : status === 'deferral_approved' || status === 'approved' ? (
-                <UniformTag color="success" text="Approved" />
-              ) : status === 'deferral_rejected' || status === 'rejected' ? (
-                <UniformTag color="error" text="Rejected" />
-              ) : (
-                <div style={{ fontWeight: 500 }}>{status}</div>
-              )}
-            </Descriptions.Item>
+            {/* Extension Status placed next to DCL No for visibility */}
+            {localDeferral.extensionStatus && (
+              <Descriptions.Item label="Extension Status">
+                <Text strong style={{ color: PRIMARY_BLUE }}>{localDeferral.extensionStatus}</Text>
+              </Descriptions.Item>
+            )}
+            {/* Show overall deferral status (hide for extension-application modal views) */}
+            {(!overrideApprovals && headerTag !== 'EXTENSION APPLICATION') && (
+              <Descriptions.Item label="Status">
+                {(() => {
+                  // If the deferral was closed/withdrawn by the RM, show Withdrawn explicitly
+                  const isWithdrawnLocal = Boolean(
+                    localDeferral?.closedByName || localDeferral?.ClosedByName ||
+                    localDeferral?.closedAt || localDeferral?.ClosedAt
+                  );
+
+                  if (isWithdrawnLocal) {
+                    return <Text strong style={{ color: ERROR_RED }}>Withdrawn</Text>;
+                  }
+
+                  const raw = (localDeferral.status || localDeferral.deferralApprovalStatus || 'pending').toString();
+                  const key = raw.toLowerCase();
+                  const display = key.replace(/_/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                  let color = PRIMARY_BLUE;
+                  if (key.includes('approved')) color = SUCCESS_GREEN;
+                  else if (key.includes('rejected')) color = ERROR_RED;
+                  else if (key.includes('returned') || key.includes('rework')) color = WARNING_ORANGE;
+                  return <Text strong style={{ color }}>{display}</Text>;
+                })()}
+              </Descriptions.Item>
+            )}
+            
 
             {/* Creator Status */}
             <Descriptions.Item label="Creator Status">
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 {(() => {
-                  const creatorStatus = overrideApprovals 
-                    ? overrideApprovals.creatorApprovalStatus 
-                    : localDeferral.creatorApprovalStatus || 'pending';
-                  
-                  if (creatorStatus === 'approved') {
-                    return (
-                      <UniformTag color="success" text="Approved" icon={<CheckCircleOutlined />} />
-                    );
-                  } else if (creatorStatus === 'rejected') {
-                    return (
-                      <UniformTag color="error" text="Rejected" icon={<CloseCircleOutlined />} />
-                    );
+                  const creatorStatusRaw = overrideApprovals ? overrideApprovals.creatorApprovalStatus : localDeferral.creatorApprovalStatus;
+                  const creatorStatus = (creatorStatusRaw || '').toString().toLowerCase();
+
+                  const creatorHasDate = Boolean(localDeferral.creatorApprovalDate || localDeferral.creatorApprovedAt || localDeferral.creatorApprovedDate || overrideApprovals?.creatorApprovalDate);
+                  const creatorApprovedFlag = creatorHasDate || creatorStatus === 'approved' || creatorStatus === 'true' || creatorStatus === true;
+
+                  if (creatorApprovedFlag) {
+                    return <Text strong style={{ color: SUCCESS_GREEN }}>Approved</Text>;
                   }
-                  return (
-                    <UniformTag color="processing" text="Pending" />
-                  );
+
+                  const creatorRejected = creatorStatus === 'rejected' || creatorStatus === 'false' || creatorStatus === false;
+                  if (creatorRejected) return <Text strong style={{ color: ERROR_RED }}>Rejected</Text>;
+
+                  return <Text strong style={{ color: PRIMARY_BLUE }}>Pending</Text>;
                 })()}
               </div>
             </Descriptions.Item>
@@ -2699,22 +2794,20 @@ const DeferralDetailsModal = ({
             <Descriptions.Item label="Checker Status">
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 {(() => {
-                  const checkerStatus = overrideApprovals 
-                    ? overrideApprovals.checkerApprovalStatus 
-                    : localDeferral.checkerApprovalStatus || 'pending';
-                  
-                  if (checkerStatus === 'approved') {
-                    return (
-                      <UniformTag color="success" text="Approved" icon={<CheckCircleOutlined />} />
-                    );
-                  } else if (checkerStatus === 'rejected') {
-                    return (
-                      <UniformTag color="error" text="Rejected" icon={<CloseCircleOutlined />} />
-                    );
+                  const checkerStatusRaw = overrideApprovals ? overrideApprovals.checkerApprovalStatus : localDeferral.checkerApprovalStatus;
+                  const checkerStatus = (checkerStatusRaw || '').toString().toLowerCase();
+
+                  const checkerHasDate = Boolean(localDeferral.checkerApprovalDate || localDeferral.checkerApprovedAt || localDeferral.checkerApprovedDate || overrideApprovals?.checkerApprovalDate);
+                  const checkerApprovedFlag = checkerHasDate || checkerStatus === 'approved' || checkerStatus === 'true' || checkerStatus === true;
+
+                  if (checkerApprovedFlag) {
+                    return <Text strong style={{ color: SUCCESS_GREEN }}>Approved</Text>;
                   }
-                  return (
-                    <UniformTag color="processing" text="Pending" />
-                  );
+
+                  const checkerRejected = checkerStatus === 'rejected' || checkerStatus === 'false' || checkerStatus === false;
+                  if (checkerRejected) return <Text strong style={{ color: ERROR_RED }}>Rejected</Text>;
+
+                  return <Text strong style={{ color: PRIMARY_BLUE }}>Pending</Text>;
                 })()}
               </div>
             </Descriptions.Item>
@@ -2724,11 +2817,11 @@ const DeferralDetailsModal = ({
               <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                 <div>
                   {stats.total === 0 ? (
-                    <UniformTag color="processing" text="No approvers" maxChars={12} />
+                    <Text strong style={{ color: PRIMARY_BLUE }}>No approvers</Text>
                   ) : stats.approved === stats.total ? (
-                    <UniformTag color="success" text="All Approved" icon={<CheckCircleOutlined />} maxChars={12} />
+                    <Text strong style={{ color: SUCCESS_GREEN }}>All Approved</Text>
                   ) : (
-                    <UniformTag color="processing" text={`${stats.approved} of ${stats.total} Approved`} maxChars={14} />
+                    <Text strong style={{ color: PRIMARY_BLUE }}>{`${stats.approved} of ${stats.total} Approved`}</Text>
                   )}
                 </div>
               </div>
@@ -2738,26 +2831,37 @@ const DeferralDetailsModal = ({
             <Descriptions.Item label="Loan Amount">
               <div style={{ fontWeight: 500, display: 'flex', alignItems: 'center', gap: 12 }}>
                 {(function () {
-                  const loanAmountCandidates = [
-                    localDeferral.loanAmount,
-                    localDeferral.requestedAmount,
-                    localDeferral.amount,
-                  ];
-                  const facilitiesTotal = (Array.isArray(localDeferral.facilities)
-                    ? localDeferral.facilities
-                    : []
-                  ).reduce((sum, facility) => {
-                    const value = Number(facility?.sanctioned ?? facility?.amount ?? 0);
-                    return sum + (Number.isFinite(value) ? value : 0);
-                  }, 0);
-                  const amt = Number(
-                    loanAmountCandidates.find((candidate) => Number(candidate || 0) > 0) || facilitiesTotal || 0,
+                  // Primary extraction
+                  let { amountNumber, formattedAmount, classification } = getLoanDisplay(localDeferral || {});
+
+                  // Fallback: check common nested places where loan amount may be stored
+                  if (!amountNumber) {
+                    const maybe =
+                      localDeferral?.requested?.loanAmount ||
+                      localDeferral?.request?.loanAmount ||
+                      localDeferral?.extension?.loanAmount ||
+                      (Array.isArray(localDeferral?.extensions) && localDeferral.extensions[0]?.loanAmount) ||
+                      localDeferral?.requestedLoanAmount ||
+                      localDeferral?.loan_amount ||
+                      localDeferral?.requested_amount;
+                    const parsed = (maybe != null) ? Number(String(maybe).replace(/[^0-9.-]+/g, '')) : 0;
+                    if (Number.isFinite(parsed) && parsed > 0) {
+                      amountNumber = parsed;
+                      formattedAmount = `KSh ${parsed.toLocaleString()}`;
+                      classification = parsed < 75000000 ? 'below 75 million' : 'above 75 million';
+                    }
+                  }
+
+                  if (!amountNumber) return <span style={{ color: PRIMARY_BLUE }}>Not specified</span>;
+
+                  // Only show the classification as plain text (remove boxed tags)
+                  return (
+                    <>
+                      {classification === 'above 75 million'
+                        ? <Text strong style={{ color: ERROR_RED }}>{'Above 75 million'}</Text>
+                        : <Text strong style={{ color: PRIMARY_BLUE }}>{'Below 75 million'}</Text>}
+                    </>
                   );
-                  if (!amt) return <span style={{ color: PRIMARY_BLUE }}>Not specified</span>;
-                  const isAbove75 = amt > 75 && amt <= 1000 ? true : (amt > 75000000 ? true : false);
-                  return isAbove75
-                    ? <Tag color={'red'} style={{ fontSize: 12 }}>Above 75 million</Tag>
-                    : <span style={{ color: PRIMARY_BLUE, fontWeight: 600 }}>Under 75 million</span>;
                 })()}
               </div>
             </Descriptions.Item>
@@ -2788,9 +2892,33 @@ const DeferralDetailsModal = ({
             <Descriptions.Item label="Created At">
               <div>
                 <Text strong style={{ color: PRIMARY_BLUE }}>{dayjs(localDeferral.createdAt || localDeferral.requestedDate).format('DD MMM YYYY')}</Text>
-                <Text type="secondary" style={{ fontSize: 11, marginLeft: 4 }}>{dayjs(localDeferral.createdAt || localDeferral.requestedDate).format('HH:mm')}</Text>
               </div>
             </Descriptions.Item>
+
+            {/* Show who withdrew/closed the deferral (if applicable) */}
+            {localDeferral.closedByName && (
+              <Descriptions.Item label="Withdrawn By">
+                <div>
+                  <Text strong style={{ color: ERROR_RED }}>{localDeferral.closedByName}</Text>
+                  {localDeferral.closedAt && (
+                    <div style={{ fontSize: 12, color: '#666' }}>{dayjs(localDeferral.closedAt).format('DD MMM YYYY')}</div>
+                  )}
+                </div>
+              </Descriptions.Item>
+            )}
+
+            {/* Extension-specific fields (if present) */}
+            {localDeferral.requestedDaysSought && (
+              <Descriptions.Item label="Requested Extension Days">
+                <Text strong style={{ color: PRIMARY_BLUE }}>{localDeferral.requestedDaysSought}</Text>
+              </Descriptions.Item>
+            )}
+            {localDeferral.extensionCreatedAt && (
+              <Descriptions.Item label="Extension Application Date">
+                <Text strong style={{ color: PRIMARY_BLUE }}>{dayjs(localDeferral.extensionCreatedAt).format('DD MMM YYYY')}</Text>
+              </Descriptions.Item>
+            )}
+            {/* extensionStatus moved next to DCL No above */}
           </Descriptions>
 
           <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid #f0f0f0' }}>
@@ -3075,14 +3203,11 @@ const DeferralDetailsModal = ({
               if (approvalsToUse && Array.isArray(approvalsToUse)) {
                 // Use extension approvers - all should be pending
                 hasApprovers = true;
-                approvalsToUse.forEach((approver, index) => {
+                  approvalsToUse.forEach((approver, index) => {
                   const isApproved = approver.approved === true || approver.approved === 'true' || approver.approvalStatus === 'approved';
                   const isRejected = approver.rejected === true || approver.rejected === 'true' || approver.approvalStatus === 'rejected';
                   const isReturned = approver.returned === true || approver.returned === 'true' || approver.approvalStatus === 'returned_for_rework';
-                  const isCurrent = !isApproved && !isRejected && !isReturned &&
-                    (index === 0 ||
-                      localDeferral.currentApprover === approver ||
-                      localDeferral.currentApprover?._id === approver?._id);
+                  const isCurrent = false; // will be computed after building the list
 
                   approvers.push({
                     ...approver,
@@ -3103,10 +3228,7 @@ const DeferralDetailsModal = ({
                   const isApproved = approver.approved === true || approver.approved === 'true';
                   const isRejected = approver.rejected === true || approver.rejected === 'true';
                   const isReturned = approver.returned === true || approver.returned === 'true';
-                  const isCurrent = !isApproved && !isRejected && !isReturned &&
-                    (index === localDeferral.currentApproverIndex ||
-                      localDeferral.currentApprover === approver ||
-                      localDeferral.currentApprover?._id === approver?._id);
+                  const isCurrent = false; // will be computed after building the list
 
                   approvers.push({
                     ...approver,
@@ -3127,10 +3249,7 @@ const DeferralDetailsModal = ({
                   const isApproved = approver.approved === true || approver.approved === 'true';
                   const isRejected = approver.rejected === true || approver.rejected === 'true';
                   const isReturned = approver.returned === true || approver.returned === 'true';
-                  const isCurrent = !isApproved && !isRejected && !isReturned &&
-                    (index === localDeferral.currentApproverIndex ||
-                      localDeferral.currentApprover === approver ||
-                      localDeferral.currentApprover?._id === approver?._id);
+                  const isCurrent = false; // will be computed after building the list
 
                   approvers.push({
                     ...approver,
@@ -3145,6 +3264,14 @@ const DeferralDetailsModal = ({
                     comment: approver.comment || ''
                   });
                 });
+              }
+
+              // Ensure only the first unapproved approver (if any) is marked as current
+              const firstUnapprovedIndex = approvers.findIndex(a => !a.isApproved && !a.isRejected && !a.isReturned);
+              if (firstUnapprovedIndex !== -1) {
+                approvers.forEach((a, i) => { a.isCurrent = (!a.isApproved && !a.isRejected && !a.isReturned) && i === firstUnapprovedIndex; });
+              } else {
+                approvers.forEach((a) => { a.isCurrent = false; });
               }
 
               if (!hasApprovers) {
@@ -3298,6 +3425,17 @@ const DeferralDetailsModal = ({
 
                     if (!requestCommentExistsInComments && !requestCommentExistsInHistory) {
                       events.push({ user: requester, userRole: requesterRole, date: requestDate, comment: requestComment });
+                    }
+
+                    // If an extension reason exists, treat it as an RM comment in the history
+                    if (localDeferral.extensionReason && String(localDeferral.extensionReason).trim()) {
+                      const extNormalized = normalizeText(localDeferral.extensionReason);
+                      const extExistsInComments = Array.isArray(localDeferral.comments) && localDeferral.comments.some((c) => normalizeText(c?.text || c?.comment) === extNormalized);
+                      const extExistsInHistory = Array.isArray(localDeferral.history) && localDeferral.history.some((h) => normalizeText(h?.comment || h?.notes || h?.message) === extNormalized);
+
+                      if (!extExistsInComments && !extExistsInHistory) {
+                        events.push({ user: requester, userRole: requesterRole, date: localDeferral.extensionCreatedAt || localDeferral.extensionCreatedAt || requestDate, comment: localDeferral.extensionReason });
+                      }
                     }
 
                     if (localDeferral.comments && Array.isArray(localDeferral.comments) && localDeferral.comments.length > 0) {
@@ -3507,148 +3645,10 @@ const DeferralPending = ({ userId = "rm_current" }) => {
     return 'pending';
   });
 
-  // Extension-related state
-  const [extensionModalOpen, setExtensionModalOpen] = useState(false);
-  const [selectedDeferralForExtension, setSelectedDeferralForExtension] = useState(null);
-  const [createExtension, { isLoading: extensionCreating }] = useCreateExtensionMutation();
-  const { data: myExtensions = [], isLoading: extensionsLoading, refetch: refetchExtensions } = useGetMyExtensionsQuery();
-  const handleExtensionSubmit = async (data) => {
-    try {
-      // Calculate total days sought (current + additional)
-      const currentDays = selectedDeferralForExtension?.daysSought || 0;
-      // The modal sends 'requestedDaysSought' which is additional days
-      const additionalDays = parseInt(data.requestedDaysSought || data.daysToExtendBy) || 0;
-      const totalDays = currentDays + additionalDays;
+  // Extension-related state removed — starting fresh later
+  // Extension submit handler removed
 
-      console.log('=== Extension Calculation Debug ===');
-      console.log('selectedDeferralForExtension:', selectedDeferralForExtension);
-      console.log('currentDays:', currentDays, 'type:', typeof currentDays);
-      console.log('data:', data);
-      console.log('additionalDays:', additionalDays, 'type:', typeof additionalDays);
-      console.log('totalDays:', totalDays, 'type:', typeof totalDays);
-
-      if (totalDays <= currentDays) {
-        message.error(`Invalid calculation: Total days (${totalDays}) must be greater than current days (${currentDays}). Additional days: ${additionalDays}`);
-        return;
-      }
-
-      const requestData = {
-        deferralId: selectedDeferralForExtension._id,
-        requestedDaysSought: totalDays, // Send total days, not just additional
-        extensionReason: data.extensionReason
-      };
-
-      console.log('Extension request data:', requestData);
-
-      await createExtension(requestData).unwrap();
-
-      // Show success modal with details
-      Modal.success({
-        title: 'Extension Request Submitted',
-        content: (
-          <div>
-            <p style={{ marginBottom: 12 }}>
-              <strong>Deferral:</strong> {selectedDeferralForExtension.deferralNumber}
-            </p>
-            <p style={{ marginBottom: 12 }}>
-              <strong>Extension Duration:</strong> {data.requestedDaysSought || data.daysToExtendBy} additional days
-            </p>
-            <p style={{ marginBottom: 0, color: '#52c41a' }}>
-              ✓ Your extension request has been successfully submitted and will follow the standard approval workflow. The first approver has been notified via email.
-            </p>
-          </div>
-        ),
-        okText: 'Done',
-        onOk() {
-          setExtensionModalOpen(false);
-          setSelectedDeferralForExtension(null);
-
-          // Close the deferral details modal to force refresh with updated extension data
-          setModalOpen(false);
-
-          // Wait a moment for the close animation, then refresh and reopen
-          setTimeout(() => {
-            refetchExtensions();
-
-            // Reopen the deferral modal with fresh data
-            setModalOpen(true);
-          }, 300);
-
-          // Refresh the deferrals list to show it in extensions tab
-          if (window.deferralRefresh) {
-            window.deferralRefresh();
-          }
-        }
-      });
-    } catch (error) {
-      console.error('Extension creation error:', error);
-      const errorMessage = error?.data?.message || error?.message || 'Failed to create extension request';
-      const errorDetails = error?.data?.errors || error?.data?.details;
-      
-      Modal.error({
-        title: 'Failed to Create Extension',
-        content: (
-          <div>
-            <p>{errorMessage}</p>
-            {errorDetails && (
-              <div style={{ marginTop: 8, fontSize: 12, color: '#666' }}>
-                {Array.isArray(errorDetails) ? (
-                  <ul style={{ margin: 0, paddingLeft: 20 }}>
-                    {errorDetails.map((err, idx) => <li key={idx}>{err}</li>)}
-                  </ul>
-                ) : (
-                  <p style={{ margin: 0 }}>{errorDetails}</p>
-                )}
-              </div>
-            )}
-          </div>
-        )
-      });
-    }
-  };
-
-  const handleOpenExtensionDetails = (extension) => {
-    if (!extension) return;
-
-    // Use the populated deferral data directly (the approved deferral)
-    const approvedDeferral = extension.deferral || {};
-    
-    if (!approvedDeferral._id) {
-      message.error('Unable to load deferral details for this extension');
-      return;
-    }
-
-    // Open the approved deferral but override approval workflow with extension's approval workflow
-    setSelectedDeferral(approvedDeferral);
-    setDetailOverrides({
-      headerTag: 'EXTENSION APPLICATION',
-      overrideDaysSought: extension.requestedDaysSought,
-      overrideNextDueDate: extension.requestedDaysSought 
-        ? dayjs(approvedDeferral.nextDueDate || approvedDeferral.nextDocumentDueDate)
-            .add(extension.requestedDaysSought, 'day')
-            .toISOString()
-        : null,
-      readOnly: true,
-      // Override approval status with extension's approval workflow
-      overrideApprovals: {
-        approvers: extension.approvers || [],
-        allApproversApproved: extension.allApproversApproved || false,
-        creatorApprovalStatus: extension.creatorApprovalStatus || 'pending',
-        checkerApprovalStatus: extension.checkerApprovalStatus || 'pending',
-        creatorApprovedBy: extension.creatorApprovedBy,
-        checkerApprovedBy: extension.checkerApprovedBy,
-        creatorApprovalDate: extension.creatorApprovalDate,
-        checkerApprovalDate: extension.checkerApprovalDate,
-        status: extension.status
-      }
-    });
-    setModalOpen(true);
-  };
-
-  const handleApplyForExtension = (deferral) => {
-    setSelectedDeferralForExtension(deferral);
-    setExtensionModalOpen(true);
-  };
+  // Extension detail handlers removed
 
   const loadDeferrals = useCallback(async () => {
     setLoading(true);
@@ -3941,12 +3941,18 @@ const DeferralPending = ({ userId = "rm_current" }) => {
       dataIndex: "status",
       key: "status",
       width: 120,
-      render: (status) => {
+      render: (status, record) => {
+        // If the deferral was explicitly closed/withdrawn by an RM, show Withdrawn
+        const withdrawnBy = record?.closedByName || record?.ClosedByName || record?.closedBy || record?.closedByUser || null;
+        if (withdrawnBy) return (<div style={{ fontSize: 11, fontWeight: 'bold', color: ERROR_RED }}>Withdrawn</div>);
+
         const s = (status || '').toLowerCase();
-        if (s === 'deferral_requested' || s === 'deferral_requested') return (<div style={{ fontSize: 11, fontWeight: 'bold', color: WARNING_ORANGE }}>Pending</div>);
+        if (s === 'deferral_requested' || s === 'pending_approval') return (<div style={{ fontSize: 11, fontWeight: 'bold', color: WARNING_ORANGE }}>Pending</div>);
         if (s === 'partially_approved') return (<div style={{ fontSize: 11, fontWeight: 'bold', color: PRIMARY_BLUE }}>Partially Approved</div>);
         if (s === 'deferral_approved' || s === 'approved') return (<div style={{ fontSize: 11, fontWeight: 'bold', color: SUCCESS_GREEN }}>Approved</div>);
         if (s === 'deferral_rejected' || s === 'rejected') return (<div style={{ fontSize: 11, fontWeight: 'bold', color: ERROR_RED }}>Rejected</div>);
+        // Treat 'closed' as Withdrawn when closedBy metadata is present
+        if (s === 'closed' && (record?.closedByName || record?.ClosedByName || record?.closedBy)) return (<div style={{ fontSize: 11, fontWeight: 'bold', color: ERROR_RED }}>Withdrawn</div>);
         return (<div style={{ fontSize: 11, fontWeight: 'bold', color: '#666' }}>{status}</div>);
       },
       filters: [
@@ -4164,7 +4170,6 @@ const DeferralPending = ({ userId = "rm_current" }) => {
           <Tabs.TabPane tab={`Re-work Deferrals (${rejectedData.length})`} key="rejected" />
           <Tabs.TabPane tab={`Close Requests (${closeRequestsData.length})`} key="closeRequests" />
           <Tabs.TabPane tab={`Completed Deferrals (${closedData.length})`} key="closed" />
-          <Tabs.TabPane tab={`Extension Applications (${myExtensions.length})`} key="extensions" />
         </Tabs>
       </div>
 
@@ -4178,20 +4183,14 @@ const DeferralPending = ({ userId = "rm_current" }) => {
                 ? `Re-work Deferrals`
                 : activeTab === 'closeRequests'
                   ? `Close Requests`
-                  : activeTab === 'closed'
+                    : activeTab === 'closed'
                     ? `Completed Deferrals`
-                    : `Extension Applications`} ({activeTab === 'extensions' ? myExtensions.length : currentData.length} items)
+                    : ``} ({currentData.length} items)
         </span>
       </Divider>
 
       {/* Extensions Tab Content */}
-      {activeTab === 'extensions' && (
-        <ExtensionApplicationsTab
-          extensions={myExtensions}
-          loading={extensionsLoading}
-          onOpenExtensionDetails={handleOpenExtensionDetails}
-        />
-      )}
+      {/* Extensions feature removed; will reintroduce a fresh implementation later */}
 
       {/* Table */}
       {activeTab !== 'extensions' && (
@@ -4290,8 +4289,6 @@ const DeferralPending = ({ userId = "rm_current" }) => {
             setDetailOverrides(null);
           }}
           onAction={handleModalAction}
-          onApplyForExtension={handleApplyForExtension}
-          myExtensions={myExtensions}
           headerTag={detailOverrides?.headerTag}
           overrideDaysSought={detailOverrides?.overrideDaysSought}
           overrideNextDueDate={detailOverrides?.overrideNextDueDate}
@@ -4300,17 +4297,7 @@ const DeferralPending = ({ userId = "rm_current" }) => {
         />
       )}
 
-      {/* Extension Application Modal */}
-      <ExtensionApplicationModal
-        open={extensionModalOpen}
-        onClose={() => {
-          setExtensionModalOpen(false);
-          setSelectedDeferralForExtension(null);
-        }}
-        deferral={selectedDeferralForExtension}
-        onSubmit={handleExtensionSubmit}
-        loading={extensionCreating}
-      />
+      {/* Extension application modal removed */}
     </div>
   );
 };
