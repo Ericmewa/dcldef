@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import dayjs from 'dayjs';
 import {
   Card,
   Input,
@@ -31,7 +32,7 @@ const SECONDARY_BLUE = "#164679";
 const ERROR_RED = "#ff4d4f";
 const WARNING_ORANGE = "#faad14"; // Added this constant
 
-function DocumentPicker({ selectedDocuments, setSelectedDocuments }) {
+function DocumentPicker({ selectedDocuments, setSelectedDocuments, perDocumentDays = {} }) {
   const [search, setSearch] = useState("");
   const [editingIndex, setEditingIndex] = useState(null);
   const [editingValue, setEditingValue] = useState("");
@@ -433,6 +434,23 @@ function DocumentPicker({ selectedDocuments, setSelectedDocuments }) {
         </div>
       ),
     },
+      {
+        title: "Requested",
+        key: "requested",
+        width: 180,
+        align: "center",
+        render: (_, record, index) => {
+          const docKey = record._id || record.name || String(index);
+          const days = perDocumentDays[docKey] ?? null;
+          const nextDate = days ? dayjs().add(Number(days), 'day').format('DD MMM YYYY') : null;
+          return (
+            <div style={{ fontSize: 13, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+              <div style={{ fontWeight: 600 }}>{days ?? '-' }{days ? ' days' : ''}</div>
+              <div style={{ color: '#666', fontSize: 12 }}>{nextDate ?? '-'}</div>
+            </div>
+          );
+        },
+      },
     {
       title: "Category",
       dataIndex: "category",

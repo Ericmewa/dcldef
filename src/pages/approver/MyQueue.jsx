@@ -1235,6 +1235,78 @@ const DeferralDetailsModal = ({
 
   const { dclDocs, uploadedDocs, requestedDocs } = getDeferralDocumentBuckets(deferral);
 
+  // Resolve per-document requested days and next due date with fallbacks
+  const resolveDocDaysAndDate = (doc, deferral) => {
+    if (!doc) return { days: undefined, date: undefined };
+
+    const pickDayCandidates = (d) => {
+      if (!d) return undefined;
+      const candidates = [
+        d.daysSought,
+        d.requestedDaysSought,
+        d.requestedDays,
+        d.daysRequested,
+        d.DaysSought,
+        d.RequestedDaysSought,
+        d.requested_days,
+        d.days_sought,
+      ];
+      for (const c of candidates) {
+        if (typeof c === 'number' && !Number.isNaN(c)) return c;
+        if (typeof c === 'string' && c.trim() !== '' && !Number.isNaN(Number(c))) return Number(c);
+      }
+      return undefined;
+    };
+
+    const pickDateCandidates = (d) => {
+      if (!d) return undefined;
+      const candidates = [
+        d.nextDocumentDueDate,
+        d.nextDueDate,
+        d.next_document_due_date,
+        d.next_due_date,
+        d.NextDocumentDueDate,
+      ];
+      for (const c of candidates) {
+        if (!c) continue;
+        const iso = String(c);
+        const parsed = dayjs(iso);
+        if (parsed.isValid()) return parsed.toISOString();
+      }
+      return undefined;
+    };
+
+    // Try doc-level values first
+    let days = pickDayCandidates(doc);
+    let date = pickDateCandidates(doc);
+
+    // If missing, try to find matching selectedDocuments inside deferral
+    if ((days === undefined || date === undefined) && deferral && Array.isArray(deferral.selectedDocuments)) {
+      const name = (doc.name || '').toString().toLowerCase();
+      const match = deferral.selectedDocuments.find((sd) => {
+        if (!sd) return false;
+        const sdName = (sd.name || sd.label || (typeof sd === 'string' ? sd : '')).toString().toLowerCase();
+        if (sdName && name && sdName === name) return true;
+        if (sdName && name && sdName.includes(name)) return true;
+        if (sd.documentType && doc.documentType && String(sd.documentType).toLowerCase() === String(doc.documentType).toLowerCase()) return true;
+        return false;
+      });
+      if (match) {
+        if (days === undefined) days = pickDayCandidates(match);
+        if (date === undefined) date = pickDateCandidates(match);
+      }
+    }
+
+    // Final fallback: if date missing but deferral.nextDueDate exists, use that
+    if (!date) {
+      const fallback = deferral?.nextDueDate || deferral?.nextDocumentDueDate || deferral?.next_due_date || deferral?.next_document_due_date || deferral?.createdAt;
+      const parsed = dayjs(fallback);
+      if (parsed.isValid()) date = parsed.toISOString();
+    }
+
+    return { days, date };
+  };
+
   const stats = getApproverStats();
   const daysSoughtValue = typeof overrideDaysSought === 'number'
     ? overrideDaysSought
@@ -1405,25 +1477,7 @@ const DeferralDetailsModal = ({
                     })()}
                   </div>
                 </Descriptions.Item>
-                <Descriptions.Item label="Days Sought">
-                  <div style={{ fontWeight: "bold", color: daysSoughtValue > 45 ? ERROR_RED : daysSoughtValue > 30 ? WARNING_ORANGE : PRIMARY_BLUE, fontSize: 14 }}>
-                    {daysSoughtValue} days
-                  </div>
-                </Descriptions.Item>
-                <Descriptions.Item label="Deferral Due Date">
-                  {(() => {
-                    const fallbackDueDate =
-                      deferral.createdAt && Number(deferral.daysSought || 0) > 0
-                        ? dayjs(deferral.createdAt).add(Number(deferral.daysSought || 0), 'day').toISOString()
-                        : null;
-                    const finalDueDate = nextDueDateValue || fallbackDueDate;
-                    return (
-                      <div style={{ color: PRIMARY_BLUE }}>
-                        {finalDueDate ? `${dayjs(finalDueDate).format('DD MMM YYYY')}` : 'Not calculated'}
-                      </div>
-                    );
-                  })()}
-                </Descriptions.Item>
+                {/* Days Sought and Deferral Due Date intentionally removed for approver details */}
                 <Descriptions.Item label="Created At"><div><Text strong style={{ color: PRIMARY_BLUE }}>{dayjs(deferral.createdAt || deferral.requestedDate).format('DD MMM YYYY')}</Text><Text type="secondary" style={{ fontSize: 11, marginLeft: 4 }}>{dayjs(deferral.createdAt || deferral.requestedDate).format('HH:mm')}</Text></div></Descriptions.Item>
               </Descriptions>
             </Card>
@@ -1445,6 +1499,16 @@ const DeferralDetailsModal = ({
                           </div>
                           <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}><b>Type:</b> {formatDeferralDocumentType(doc)}</div>
                           {uploadedVersion && (<div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>Uploaded as: {uploadedVersion.name} {uploadedVersion.uploadDate ? `• ${dayjs(uploadedVersion.uploadDate).format('DD MMM YYYY HH:mm')}` : ''}</div>)}
+                          {/* Per-document requested days and new due date */}
+                          {(() => {
+                            const resolved = resolveDocDaysAndDate(doc, deferral);
+                            return (
+                              <div style={{ marginTop: 6, fontSize: 12, color: '#444' }}>
+                                <div><b>Requested days:</b> {typeof resolved.days === 'number' ? `${resolved.days} days` : '-'}</div>
+                                <div><b>New due date:</b> {resolved.date ? dayjs(resolved.date).format('DD MMM YYYY') : '-'}</div>
+                              </div>
+                            );
+                          })()}
                         </div>
                       </div>
                       <Space>
@@ -1851,8 +1915,47 @@ const MyQueue = () => {
   const [activeTab, setActiveTab] = useState("deferrals");
   const token = useSelector(state => state.auth.token);
 
-  // Fetch pending extension applications
-  const { data: queueExtensions = [], isLoading: extensionsLoading } = useGetApproverExtensionsQuery();
+  // Fetch pending extension applications (fallback to direct fetch since RTK hook is not available)
+  const [queueExtensions, setQueueExtensions] = useState([]);
+  const [extensionsLoading, setExtensionsLoading] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    const fetchExtensions = async () => {
+      setExtensionsLoading(true);
+      try {
+        const rawApi = String(import.meta.env.VITE_API_URL || "").trim().replace(/^['"]|['"]$/g, "");
+        const base = rawApi ? (/^https?:\/\//i.test(rawApi) ? rawApi : (rawApi.startsWith(":") ? `http://localhost${rawApi}` : `http://${rawApi}`)) : "http://localhost:5000";
+        const url = `${base.replace(/\/+$/, "")}/api/extensions/approver/queue`;
+        const stored = JSON.parse(localStorage.getItem('user') || 'null');
+        const t = token || stored?.token;
+
+        let res = await fetch(url, { headers: { ...(t ? { authorization: `Bearer ${t}` } : {}) } });
+        // Try relative path fallback if absolute fails
+        if (!res.ok) {
+          try {
+            res = await fetch('/api/extensions/approver/queue', { headers: { ...(t ? { authorization: `Bearer ${t}` } : {}) } });
+          } catch (e) {
+            // ignore
+          }
+        }
+
+        if (res && res.ok) {
+          const data = await res.json().catch(() => []);
+          if (mounted) setQueueExtensions(Array.isArray(data) ? data : []);
+        } else {
+          if (mounted) setQueueExtensions([]);
+        }
+      } catch (err) {
+        console.error('Failed to load extension applications for approver queue', err);
+        if (mounted) setQueueExtensions([]);
+      } finally {
+        if (mounted) setExtensionsLoading(false);
+      }
+    };
+    fetchExtensions();
+    return () => { mounted = false; };
+  }, [token]);
 
   // State for modal
   const [selectedDeferral, setSelectedDeferral] = useState(null);
@@ -2264,6 +2367,48 @@ const MyQueue = () => {
       background: none !important;
     }
   `;
+
+  // Lightweight ExtensionApplicationsTab used in approver MyQueue when the dedicated component is not present
+  const ExtensionApplicationsTab = ({ extensions = [], loading = false, tableClassName = '', onOpenExtensionDetails = () => {} }) => {
+    const extColumns = [
+      {
+        title: 'Extension No',
+        dataIndex: 'id',
+        width: 140,
+        render: (v, r) => r?.id || r?._id || (r?.extensionNumber || r?.extensionNo) || 'N/A'
+      },
+      { title: 'Deferral No', dataIndex: 'deferralNumber', width: 140, render: (v, r) => r?.deferralNumber || r?.deferral?.deferralNumber || r?.deferralNumber || r?.deferralNo || 'N/A' },
+      { title: 'Customer', dataIndex: 'customerName', width: 220, render: (v) => v || 'N/A' },
+      { title: 'Requested Days', dataIndex: 'requestedDaysSought', width: 120, align: 'center', render: (v, r) => (v ?? r?.requestedDaysSought ?? r?.requestedDays ?? r?.RequestedDaysSought) || 'N/A' },
+      { title: 'Status', dataIndex: 'status', width: 120, render: (s) => (s ? String(s).replace(/_/g, ' ') : 'Pending') },
+      { title: 'Requested At', dataIndex: 'createdAt', width: 160, render: (d) => d ? dayjs(d).format('DD MMM YYYY') : '' },
+      {
+        title: 'Actions', dataIndex: 'actions', width: 120, render: (_, r) => {
+          return (
+            <Button size="small" type="link" onClick={(e) => { e.stopPropagation(); onOpenExtensionDetails(r); }}>View</Button>
+          );
+        }
+      }
+    ];
+
+    return (
+      <Card>
+        <div className={tableClassName}>
+          <Table
+            columns={extColumns}
+            dataSource={Array.isArray(extensions) ? extensions : []}
+            rowKey={(rec) => rec.id || rec._id || `${rec.deferralId || rec.deferral?.id || Math.random()}`}
+            pagination={{ pageSize: 8 }}
+            loading={loading}
+            size="middle"
+            onRow={(record) => ({
+              onClick: () => onOpenExtensionDetails(record),
+            })}
+          />
+        </div>
+      </Card>
+    );
+  };
 
   return (
     <div style={{ padding: 24 }}>

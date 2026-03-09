@@ -84,6 +84,8 @@ const Actioned = () => {
   const token = useSelector((s) => s.auth.token);
   const [deferrals, setDeferrals] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [actionedExtensions, setActionedExtensions] = useState([]);
+  const [extensionsLoading, setExtensionsLoading] = useState(false);
   const [selected, setSelected] = useState(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [newComment, setNewComment] = useState("");
@@ -919,6 +921,40 @@ const Actioned = () => {
       render: (d, r) => <Text>{dayjs(r.updatedAt || r.approvedAt || r.updatedAt).format('DD MMM YYYY HH:mm')}</Text>
     }
   ];
+
+  // Lightweight placeholder for Extension applications tab to avoid runtime errors
+  const ExtensionApplicationsTab = ({
+    extensions = [],
+    loading = false,
+    tableClassName = '',
+    useTableCard = true,
+    onOpenExtensionDetails = () => {},
+  }) => {
+    if (loading) return (
+      <Card>
+        <div style={{ display: 'flex', justifyContent: 'center', padding: 24 }}><Spin /></div>
+      </Card>
+    );
+
+    if (!extensions || extensions.length === 0) return (
+      <Card>
+        <Empty description={<div>No actioned extension applications</div>} />
+      </Card>
+    );
+
+    return (
+      <Card>
+        <List
+          dataSource={extensions}
+          renderItem={(ext) => (
+            <List.Item onClick={() => onOpenExtensionDetails(ext)} style={{ cursor: 'pointer' }}>
+              <List.Item.Meta title={ext.extensionNumber || ext.deferralNumber || ext._id || 'Extension'} description={ext.customerName || ''} />
+            </List.Item>
+          )}
+        />
+      </Card>
+    );
+  };
 
   return (
     <div style={{ padding: 24 }}>

@@ -635,7 +635,22 @@ export default function DeferralForm({ userId, onSuccess }) {
         });
       }
 
-      // If an uploaded DCL file exists, use it
+      // Prefer generating a fresh checklist PDF (same file the My Queue download uses).
+      // If generation succeeds we attach it; otherwise fall back to any existing uploaded file.
+      try {
+        const blob = await generateChecklistPDFBlob(checklist, allDocs, checklist.comments || []);
+        if (blob) {
+          const fileName = `${dclNumber || checklist.dclNo || 'DCL'}.pdf`;
+          const generatedFile = new File([blob], fileName, { type: 'application/pdf' });
+          setDclFile(generatedFile);
+          message.success(`${fileName} auto-generated and attached`);
+          return;
+        }
+      } catch (genErr) {
+        console.error('Failed to auto-generate DCL PDF:', genErr);
+      }
+
+      // If generation failed or produced no blob, fall back to an existing uploaded DCL file (if present)
       if (allDocs.length > 0) {
         allDocs.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
         const latestDoc = allDocs[0];
@@ -645,19 +660,6 @@ export default function DeferralForm({ userId, onSuccess }) {
           setDclFile({ name: fileName, url: fileUrl, type: latestDoc.type || 'DCL', isDCL: true, size: latestDoc.size || 0 });
           return;
         }
-      }
-
-      // No existing upload found — try to auto-generate a PDF from checklist data
-      try {
-        const blob = await generateChecklistPDFBlob(checklist, allDocs, checklist.comments || []);
-        if (blob) {
-          const fileName = `${dclNumber || checklist.dclNo || 'DCL'}.pdf`;
-          const generatedFile = new File([blob], fileName, { type: 'application/pdf' });
-          setDclFile(generatedFile);
-          message.success(`${fileName} auto-generated and attached`);
-        }
-      } catch (genErr) {
-        console.error('Failed to auto-generate DCL PDF:', genErr);
       }
     } catch (err) {
       console.error("Failed to fetch DCL file:", err);
@@ -1031,46 +1033,66 @@ export default function DeferralForm({ userId, onSuccess }) {
 
 
 
-        {/* Per-document days sought: replaced global days with per-document inputs */}
+        {/* Per-document days sought: improved layout with column labels and helper text */}
         <Col span={24}>
-          <Text strong style={{ display: 'block', marginBottom: 8 }}>Days Sought (per document)</Text>
-          {selectedDocuments && selectedDocuments.length > 0 ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {selectedDocuments.map((doc, idx) => {
-                const docKey = doc._id || doc.name || String(idx);
-                const days = perDocumentDays[docKey] ?? 0;
-                const computedDate = days ? dayjs().add(Number(days), 'day').format('YYYY-MM-DD') : '';
-                return (
-                  <div key={docKey} style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-                    <div style={{ flex: 1 }}>
-                      <Text>{doc.name}</Text>
-                      <div style={{ fontSize: 12, color: '#777' }}>{doc.type || ''}</div>
-                    </div>
-                    <div style={{ width: 180 }}>
-                      <InputNumber
-                        min={0}
-                        value={days}
-                        onChange={(v) => handlePerDocumentDaysChange(docKey, v)}
-                        style={{ width: '100%' }}
-                        size="large"
-                      />
-                    </div>
-                    <div style={{ width: 220 }}>
-                      <DatePicker
-                        value={computedDate ? dayjs(computedDate) : null}
-                        format="DD/MM/YYYY"
-                        disabled
-                        style={{ width: '100%' }}
-                        size="large"
-                      />
-                    </div>
-                  </div>
-                );
-              })}
+          <Card size="small" style={{ marginBottom: 16 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <div>
+                <Text strong style={{ display: 'block' }}>Days Sought (per document)</Text>
+              </div>
             </div>
-          ) : (
-            <Text type="secondary">Select documents to set days sought per document.</Text>
-          )}
+
+            {/* Column labels */}
+            <Row gutter={12} style={{ padding: '8px 0', borderBottom: '1px solid #f0f0f0', marginBottom: 12 }}>
+              <Col xs={12} sm={12} md={10}><Text strong>Document</Text></Col>
+              <Col xs={6} sm={6} md={4}><Text strong style={{ display: 'inline-block' }}>Days</Text></Col>
+              <Col xs={6} sm={6} md={6}><Text strong>New Due Date</Text></Col>
+            </Row>
+
+            {selectedDocuments && selectedDocuments.length > 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {selectedDocuments.map((doc, idx) => {
+                  const docKey = doc._id || doc.name || String(idx);
+                  const days = perDocumentDays[docKey] ?? 0;
+                  const computedDate = days ? dayjs().add(Number(days), 'day').format('YYYY-MM-DD') : '';
+                  return (
+                    <Row key={docKey} align="middle" gutter={12} style={{ padding: '8px 0', borderRadius: 4 }}>
+                      <Col xs={24} sm={12} md={10}>
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                          <Text strong style={{ marginBottom: 4 }}>{doc.name}</Text>
+                          <Text type="secondary" style={{ fontSize: 12 }}>{doc.type || ''}</Text>
+                        </div>
+                      </Col>
+
+                      <Col xs={12} sm={6} md={4}>
+                        <InputNumber
+                          min={0}
+                          value={days}
+                          onChange={(v) => handlePerDocumentDaysChange(docKey, v)}
+                          style={{ width: '100%' }}
+                          size="middle"
+                          placeholder="Days"
+                          aria-label={`Days sought for ${doc.name}`}
+                        />
+                      </Col>
+
+                      <Col xs={12} sm={6} md={6}>
+                        <DatePicker
+                          value={computedDate ? dayjs(computedDate) : null}
+                          format="DD/MM/YYYY"
+                          disabled
+                          style={{ width: '100%' }}
+                          size="middle"
+                        />
+                      </Col>
+                    </Row>
+                  );
+                })}
+              </div>
+            ) : (
+              <Text type="secondary">Select documents to set days sought per document.</Text>
+            )}
+          </Card>
         </Col>
 
 
@@ -1097,6 +1119,7 @@ export default function DeferralForm({ userId, onSuccess }) {
           <DocumentPicker
             selectedDocuments={selectedDocuments}
             setSelectedDocuments={setSelectedDocuments}
+            perDocumentDays={perDocumentDays}
           />
         </Col>
 
@@ -1671,8 +1694,6 @@ export default function DeferralForm({ userId, onSuccess }) {
               )}
             </div>
           </Descriptions.Item>
-          <Descriptions.Item label="Days Sought">Per document</Descriptions.Item>
-          <Descriptions.Item label="Deferred due date">Per document</Descriptions.Item>
 
           <Descriptions.Item label="Document(s) to be deferred">
           {selectedDocuments && selectedDocuments.length > 0 ? (

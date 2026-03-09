@@ -746,6 +746,9 @@ const Deferrals = ({ userId }) => {
   const [deferrals, setDeferrals] = useState([]);
   const [filteredDeferrals, setFilteredDeferrals] = useState([]);
   // Extensions removed — fresh implementation planned
+  // Keep a placeholder state for extensions to avoid runtime ReferenceErrors
+  const [myExtensions, setMyExtensions] = useState([]);
+  const [extensionsLoading, setExtensionsLoading] = useState(false);
 
   const [activeTab, setActiveTab] = useState(() => {
     try {
