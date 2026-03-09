@@ -755,6 +755,9 @@ const Deferrals = ({ userId }) => {
   const [deferrals, setDeferrals] = useState([]);
   const [filteredDeferrals, setFilteredDeferrals] = useState([]);
   // Extensions removed — fresh implementation planned
+  // Placeholder state for extension applications (to be implemented)
+  const [myExtensions, setMyExtensions] = useState([]);
+  const [extensionsLoading, setExtensionsLoading] = useState(false);
   const [activeTab, setActiveTab] = useState(() => {
     try {
       const q = new URLSearchParams(window.location.search);
@@ -2689,7 +2692,10 @@ const Deferrals = ({ userId }) => {
             tab={`Completed Deferrals (${deferrals.filter((d) => ["closed", "deferral_closed", "closed_by_co", "closed_by_creator"].includes((d.status || "").toString().toLowerCase())).length})`}
             key="completed"
           />
-          {/* Extensions tab removed */}
+          <Tabs.TabPane
+            tab={`Extension Applications (${myExtensions.length})`}
+            key="extensions"
+          />
         </Tabs>
         <div style={{ marginTop: 8, fontWeight: 700, color: PRIMARY_BLUE }}>
           {activeTab === "pending"
@@ -2698,12 +2704,54 @@ const Deferrals = ({ userId }) => {
               ? `Close Requests (${filteredDeferrals.length} items)`
             : activeTab === "approved"
               ? `Approved Deferrals (${filteredDeferrals.length} items)`
-              : `Completed Deferrals (${filteredDeferrals.length} items)`}
+              : activeTab === "extensions"
+                ? `Extension Applications (${myExtensions.length} items)`
+                : `Completed Deferrals (${filteredDeferrals.length} items)`}
         </div>
       </div>
 
       {/* Deferrals Table or Extensions */}
-      {loading ? (
+      {activeTab === 'extensions' ? (
+        extensionsLoading ? (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "center",
+              alignItems: "center",
+              padding: 40,
+            }}
+          >
+            <Spin tip={`Loading extension applications...`} />
+          </div>
+        ) : myExtensions.length === 0 ? (
+          <Empty
+            description={
+              <div>
+                <p style={{ fontSize: 16, marginBottom: 8 }}>No extension applications found</p>
+                <p style={{ color: "#999" }}>No extension applications are currently available.</p>
+              </div>
+            }
+            style={{ padding: 40 }}
+          />
+        ) : (
+          <div className="deferrals-table">
+            <Table
+              columns={columns}
+              dataSource={myExtensions}
+              rowKey={(record) => record._id || record.id}
+              size="large"
+              pagination={{
+                pageSize: 10,
+                showSizeChanger: true,
+                pageSizeOptions: ["10", "20", "50"],
+                position: ["bottomCenter"],
+                showTotal: (total, range) =>
+                  `${range[0]}-${range[1]} of ${total} extension applications`,
+              }}
+            />
+          </div>
+        )
+      ) : loading ? (
         <div
           style={{
             display: "flex",
